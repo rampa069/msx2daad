@@ -17,6 +17,9 @@ Any change to the repository that affects build commands, project structure, con
 - **Post-link**: `hex2bin` converts `.ihx` → `.com`; binary is copied to `dsk/`.
 - **Host tools**: `gcc` (for `bin/testdaad`), `php` (for `bin/precomp.php`, `bin/imgwizard.php`).
 - Docker must be running before any `make` target. No `docker-compose` is used — the Makefile calls `docker run` directly.
+- **Native SDCC 4.6.0** (e.g. Homebrew) also builds the program and all unit tests by overriding the tools: `make AS=sdasz80 AR=sdar CC=sdcc HEX2BIN=<hex2bin>`. Two things keep it working:
+    - Prototypes in `include/daad_platform_api.h` must not be declared `inline`. SDCC 4.6.0 enforces C99 inline semantics (error 328) in every translation unit that includes the header; the platform `.c` files keep `inline` on their definitions.
+    - SDCC 4.6.0 (z80) hits a fatal internal error (`gen.c` line 1334) when `x > 0`, with `x` an extern `uint8_t`, is passed as a `bool` argument followed by a pointer argument (e.g. `ASSERT(counter > 0, "msg")`). Write `x != 0` instead.
 
 ### Key commands
 
