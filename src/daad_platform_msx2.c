@@ -968,9 +968,7 @@ bool gfxPicturePrepare(uint8_t location)
 	pic[1] = location%10 + '0';
 	location /= 10;
 	pic[0] = location%10 + '0';
-	
-	gfxWinOffsetX = cw->winX * FONTWIDTH;
-	gfxWinOffsetY = cw->winY * FONTHEIGHT;
+
 	return fileexists(FILE_IMG);
 }
 
@@ -986,6 +984,13 @@ inline bool gfxPictureShow()
 {
 	uint16_t fp;
 	IMG_CHUNK *chunk = (IMG_CHUNK*)heap_top;
+
+	// The picture goes to the window that is current now (DISPLAY), not the one
+	// that was current at PICTURE: "On pixel type machines the action will
+	// introduce the required window data and clipped picture to the current
+	// stream" (DAAD manual 1991, DISPLAY). A FIXEDIMG chunk can still override it.
+	gfxWinOffsetX = cw->winX * FONTWIDTH;
+	gfxWinOffsetY = cw->winY * FONTHEIGHT;
 
 	fp = fopen(FILE_IMG);
 	if (fp<0xff00) {
