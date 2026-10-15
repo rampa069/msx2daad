@@ -396,7 +396,7 @@ void test_DOALL_no_objects_calls_NEWTEXT()
 
 	do_DOALL();
 
-	ASSERT(fake_clearLogicalSentences_calls > 0, "DOALL no-objects must call clearLogicalSentences (NEWTEXT effect)");
+	ASSERT(fake_clearLogicalSentences_calls != 0, "DOALL no-objects must call clearLogicalSentences (NEWTEXT effect)");
 	SUCCEED();
 }
 
@@ -461,7 +461,7 @@ void test_DOALL_two_consecutive_DEJAR_TODO_second_cancels_cleanly()
 	//     in the player handler → REDO swallowed input silently.
 	ASSERT_EQUAL(isDone, false,
 		"2nd DEJAR TODO: isDone must be false after NOTDONE (post-OR must not re-set it)");
-	ASSERT(fake_clearLogicalSentences_calls > 0,
+	ASSERT(fake_clearLogicalSentences_calls != 0,
 		"2nd DEJAR TODO: NEWTEXT must fire (lsBuffer cleared)");
 	SUCCEED();
 }
