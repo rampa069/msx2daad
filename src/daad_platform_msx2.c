@@ -18,6 +18,9 @@
 #include "daad.h"
 #include "vdp.h"
 #include "dos.h"
+#ifdef V9990
+	#include "gfx9000.h"
+#endif
 #if defined(TEST) || defined(DEBUG)
 	#include "debug.h"
 #endif
@@ -98,6 +101,11 @@ bool checkPlatformSystem()
 	if ((varMODE & 0x06) < 0x04) {
 		die("MSX2 with 128Kb VRAM is needed!\n");
 	}
+	#ifdef V9990
+		if (!g9kDetect()) {
+			die("GFX9000 (V9990) is needed!\n");
+		}
+	#endif
 	// If compiled with MSXDOS2 lib check for DOS version
 	#ifdef MSXDOS2
 		if (dosver()<VER_MSXDOS2x) {
@@ -419,6 +427,25 @@ void printXMES(uint16_t address)
 		0x670, // 3_ 760 light amber
 		0,0,0,0, 0,0,0,0, 0,0,0,0
 	};
+#elif defined(V9990)	// GFX9000 BD16: direct colours GRB555 (the GRB333 EGA palette below, scaled to 5 bits)
+	static uint16_t colorTranslation[] = {	// EGA Palette -> GRB555 (GGGGGRRRRRBBBBB); GFX 9 changes it
+		0x0000, //  0: black
+		0x001B, //  1: blue
+		0x6C00, //  2: green
+		0x6C1B, //  3: dark cyan
+		0x0360, //  4: red
+		0x037B, //  5: dark purple
+		0x2760, //  6: orange
+		0x6F7B, //  7: light gray
+		0x2529, //  8: dark gray
+		0x4A5F, //  9: light blue
+		0x7DAD, // 10: light green
+		0x7DBF, // 11: light cyan
+		0x37ED, // 12: light red
+		0x37FF, // 13: light purple
+		0x7FED, // 14: yellow
+		0x7FFF  // 15: white
+	};
 #else				// Paletted colors GRB333 (SCREEN 5,7,10)
 	static const uint16_t colorTranslation[] = {	// EGA Palette -> MSX grb
 		0x000, // 0: 000 black
@@ -440,10 +467,66 @@ void printXMES(uint16_t address)
 	};
 #endif
 
+#ifdef V9990
+	// The V9938 helpers used below, on the V9990. bitBlt() keeps its V9938
+	// arguments: the colour is an EGA index (getColor) and cmd is a V9938
+	// command | logical operation, translated to the V9990 command engine.
+	#define waitVDPready()		g9kWaitCmd()
+	#define setVPage(page)		g9kSetScrollY((page) ? 256 : 0)
+	#define bitBlt				g9kBitBlt
+
+	static G9K_CMD g9kCmd;
+
+	static void g9kBitBlt(uint16_t sx, uint16_t sy, uint16_t dx, uint16_t dy, uint16_t nx, uint16_t ny, uint8_t col, uint8_t arg, uint8_t cmd)
+	{
+		// V9938 LOG_IMP, AND, OR, XOR, NOT -> V9990 L11-L00 truth tables
+		static const uint8_t g9kLogTable[] = { G9K_LOG_IMP, G9K_LOG_AND, G9K_LOG_OR, G9K_LOG_XOR, G9K_LOG_NOT, G9K_LOG_IMP, G9K_LOG_IMP, G9K_LOG_IMP };
+		arg;
+		g9kCmd.sx = sx;
+		g9kCmd.sy = sy;
+		g9kCmd.dx = dx;
+		g9kCmd.dy = dy;
+		g9kCmd.nx = nx;
+		g9kCmd.ny = ny;
+		g9kCmd.arg = 0;
+		g9kCmd.log = g9kLogTable[cmd & 0x07] | ((cmd & LOG_TIMP) ? G9K_LOG_TP : 0);
+		// Write all 16 bits, so bit 15 (YS) is always 0: transparency (TP) compares the
+		// whole word with 0. A NOT would set it (NOT white = 0x8000), so it is masked there.
+		g9kCmd.mask = ((cmd & 0x07) == LOG_NOT) ? 0x7FFF : 0xFFFF;
+		g9kCmd.bc = 0;
+		cmd &= 0xF0;
+		if (cmd==CMD_HMMV || cmd==CMD_LMMV) {
+			g9kCmd.fc = colorTranslation[col & 0x0F];
+			g9kCmd.op = G9K_OP_LMMV;
+		} else {
+			g9kCmd.fc = 0;
+			g9kCmd.op = G9K_OP_LMMM;	// CMD_HMMM, CMD_LMMM
+		}
+		g9kSendCmd(&g9kCmd);
+	}
+
+	// LMMC of the picture being loaded: its data is in the VRAM picture buffer
+	static G9K_CMD g9kPicture;
+	static bool g9kPicturePending;
+
+	static void g9kPictureDraw()
+	{
+		if (!g9kPicturePending) return;
+		g9kPicturePending = false;
+		g9kPicture.sx = (uint8_t)G9K_VRAM_SCRATCH;					// BMXL source address: SA bits 7-0
+		g9kPicture.sy = (uint16_t)(G9K_VRAM_SCRATCH >> 8);			// SA bits 18-8
+		g9kPicture.arg = 0;
+		g9kPicture.op = G9K_OP_BMXL;
+		g9kSendCmd(&g9kPicture);
+	}
+#endif
+
 uint8_t getColor(uint8_t col)
 {
 	col;
-	#if SCREEN == 6
+	#if defined(V9990)
+		return col % 16;		// EGA index: g9kBitBlt() looks up the GRB555 colour
+	#elif SCREEN == 6
 		col %= 4;
 		return col | (col << 2) | (col << 4) | (col << 6);
 	#elif SCREEN < 8
@@ -467,6 +550,21 @@ uint8_t getColor(uint8_t col)
  */
 void gfxSetScreen()
 {
+#ifdef V9990
+	//GFX9000: B1 BD16, image space 256x1024. The MSX VDP keeps its text mode.
+	g9kPicturePending = false;		// The CRT0 does not clear uninitialised data
+	g9kInitB1BD16();
+	g9kSetScrollY(0);
+	//EGA palette in the V9990 palette (only the backdrop colour uses it)
+	for (uint8_t i=0; i<16; i++) {
+		uint16_t grb = colorTranslation[i];
+		g9kSetPaletteRGB(i, (grb >> 5) & 0x1F, (grb >> 10) & 0x1F, grb & 0x1F);
+	}
+	//Clear the visible and the back screens, the font zone and the TEMP zone
+	bitBlt(0, 0, 0, 0, SCREEN_WIDTH, 512, getColor(0), 0, CMD_HMMV);
+	g9kWaitCmd();
+	g9kDisplayOn();
+#else
 	//Set Color 15,0,0
 	setColor(15, 0, 0);
 	//Set SCREEN mode with interslot BIOS call
@@ -514,6 +612,7 @@ void gfxSetScreen()
 	#if SCREEN!=8 && SCREEN!=12
 		setPalette(colorTranslation);
 	#endif
+#endif //V9990
 
 	//Disable keys typing sound
 //	ADDR_POINTER_BYTE(CLIKSW) = 0;
@@ -579,14 +678,20 @@ void gfxSetScreen()
  * 					16|8  - SCREEN 8
  * 					16|10 - SCREEN 10
  * 					16|12 - SCREEN 12
- * 
+ * 				Bit 5: Is a GFX9000 (V9990) mode
+ * 					32|4|2 - B1 (256x212) BD16 (32768 colours)
+ *
  * @return		none.
  */
 void gfxSetScreenModeFlags()
 {
 	// Set Graphics & ScreenMode flag
 	flags[fGFlags] = 0b10000000;
-	flags[fScMode] = 16|SCREEN;
+	#ifdef V9990
+		flags[fScMode] = 32|4|2;
+	#else
+		flags[fScMode] = 16|SCREEN;
+	#endif
 }
 
 /*
@@ -662,7 +767,7 @@ inline void gfxScrollUp()
 inline void gfxSetPaperCol(uint8_t col)
 {
 	col;
-	#if SCREEN < 12
+	#if SCREEN < 12 || defined(V9990)
 		COLOR_PAPER = getColor(col);
 	#endif
 }
@@ -678,7 +783,7 @@ inline void gfxSetPaperCol(uint8_t col)
 inline void gfxSetInkCol(uint8_t col)
 {
 	col;
-	#if SCREEN < 12
+	#if SCREEN < 12 || defined(V9990)
 		COLOR_INK = getColor(col);
 	#endif
 }
@@ -694,7 +799,11 @@ inline void gfxSetInkCol(uint8_t col)
  */
 inline void gfxSetBorderCol(uint8_t col)
 {
-	setBorder(colorTranslation[col % 16]);
+	#ifdef V9990
+		g9kSetReg(G9K_R_BACKDROP, col % 16);	// Palette entries 0-15 hold the EGA colours
+	#else
+		setBorder(colorTranslation[col % 16]);
+	#endif
 }
 
 /*
@@ -729,7 +838,7 @@ static void gfxPutChPixels(uint8_t c, uint16_t dx, uint16_t dy)
 
 	if ((cw->mode & MODE_FORCEGCHAR) || offsetText) sy += (256+8);
 
-	#if SCREEN <= 10
+	#if SCREEN <= 10 || defined(V9990)
 		#ifdef DISABLE_GFXCHAR_COLOR
 			if (c>=128-16) {
 				bitBlt(sx, sy, dx, dy, FONTWIDTH, FONTHEIGHT, 0x00, 0, AUX_HMMM);
@@ -823,7 +932,14 @@ inline void gfxPutInputEcho(char c, bool keepPos)
 inline void gfxSetPalette(uint8_t index, uint8_t red, uint8_t green, uint8_t blue)
 {
 	index, red, green, blue;
-#if SCREEN == 8
+#if defined(V9990)
+	index %= 16;
+	red >>= 3;
+	green >>= 3;
+	blue >>= 3;
+	colorTranslation[index] = G9K_GRB555(red, green, blue);
+	g9kSetPaletteRGB(index, red, green, blue);
+#elif SCREEN == 8
 	index %= 16;
 	((uint8_t*)colorTranslationSC8)[index] = (green & 0xE0) | ((red & 0xE0) >> 3) | ((blue & 0xE0) >> 6);
 #elif SCREEN != 12
@@ -879,6 +995,9 @@ inline bool gfxPictureShow()
 		do {
 			size = fread((char*)chunk, 5);				// Read next chunk type + size + auxData
 			if (size & 0xff00) continue;
+			#ifdef V9990
+				if (chunk->type!=IMG_CHUNK_G9KDATA) g9kPictureDraw();	// The data of a pending LMMC ended
+			#endif
 
 			//=============================================
 			// Redirect to another picture
@@ -902,7 +1021,7 @@ inline bool gfxPictureShow()
 			//=============================================
 			// Load image palette
 			if (chunk->type==IMG_CHUNK_PALETTE) {
-				#if SCREEN!=8 && SCREEN!=12
+				#if SCREEN!=8 && SCREEN!=12 && !defined(V9990)
 					size = fread(chunk->data, 32);
 					if (!(size & 0xff00)) {
 						memcpy((void*)colorTranslation, chunk->data, 32);
@@ -919,6 +1038,57 @@ inline bool gfxPictureShow()
 				gfxWinOffsetX = ((IMG_FIXEDIMG*)chunk)->offsetX;
 				gfxWinOffsetY = ((IMG_FIXEDIMG*)chunk)->offsetY;
 			} else
+#ifdef V9990
+			//=============================================
+			// Chunk with V9990 Commands. An LMMC is not sent: its data
+			// (IMG_CHUNK_G9KDATA) goes to the VRAM picture buffer and the
+			// rectangle is drawn with a BMXL after the last data chunk.
+			if (chunk->type==IMG_CHUNK_G9KCMD) {
+				char *p = &((IMG_V9990_CMD*)chunk)->cmdCount;
+				size = fread(p, ((IMG_CHUNK_HEADER*)chunk)->extraHeaderSize + ((IMG_CHUNK_HEADER*)chunk)->dataSize);
+				if (!(size & 0xff00)) {
+					uint8_t cmdCount = *p;
+					p++;
+					while (cmdCount--) {
+						G9K_CMD *cmd = (G9K_CMD*)p;
+						cmd->dx += gfxWinOffsetX;
+						cmd->dy += gfxWinOffsetY + gfxPictureOffsetY;
+						g9kPictureDraw();
+						if (cmd->op == G9K_OP_LMMC) {
+							memcpy(&g9kPicture, cmd, sizeof(G9K_CMD));
+							g9kPicturePending = true;
+							g9kScratchBegin();
+						} else {
+							g9kSendCmd(cmd);
+						}
+						p += sizeof(G9K_CMD);
+					}
+				}
+			} else
+			//=============================================
+			// V9990 command data chunk: decompress to the picture buffer
+			if (chunk->type==IMG_CHUNK_G9KDATA) {
+				char *p = &((IMG_V9938_CMDDATA*)chunk)->compressorID;
+				size = fread(p, ((IMG_CHUNK_HEADER*)chunk)->extraHeaderSize + ((IMG_CHUNK_HEADER*)chunk)->dataSize);
+				if (!(size & 0xff00)) {
+					uint8_t  compID = *p;					// compressorID;
+					uint16_t uncomp = *((uint16_t*)++p);	// uncompressedSize;
+					p += 2;
+					switch (compID) {
+	#ifdef COMPRESSOR_RAW
+						case 0:  g9kScratchRaw(p, uncomp); break;		// RAW
+	#endif//COMPRESSOR_RAW
+	#ifdef COMPRESSOR_RLE
+						case 1:  g9kScratchRLE(p); break;				// RLE
+	#endif//COMPRESSOR_RLE
+	#ifdef COMPRESSOR_ZX0
+						case 3:  g9kScratchZX0(p); break;				// ZX0
+	#endif//COMPRESSOR_ZX0
+					}
+					g9kScratchAdvance(uncomp);
+				}
+			} else
+#else
 			//=============================================
 			// Chunk with V9938 Commands to prepare IMG_CHUNK_CMDDATA
 			if (chunk->type==IMG_CHUNK_CMD) {
@@ -961,12 +1131,17 @@ inline bool gfxPictureShow()
 #endif//COMPRESSOR_ZX0
 					}
 				}
-			} else {
+			} else
+#endif//V9990
+			{
 				//=============================================
 				// Skip unknown/deprecated chunks
 				fseek(chunk->chunkSize, SEEK_CUR);
 			}
 		} while (!(size & 0xff00));
+		#ifdef V9990
+			g9kPictureDraw();
+		#endif
 
 		fclose();
 		return true;
@@ -1037,7 +1212,12 @@ inline void gfxRoutines(uint8_t routine, uint8_t value)
 		//=================== Get Palette (10)
 		case GFX_GET_PALETTE: {
 			uint8_t idx = flags[value] % 16;
-			#if SCREEN == 8
+			#if defined(V9990)
+				uint16_t grb = colorTranslation[idx];
+				flags[value+1] = (uint8_t)((grb >> 2) & 0xF8);	// Red:   bits 9-5   → bits 7-3
+				flags[value+2] = (uint8_t)((grb >> 7) & 0xF8);	// Green: bits 14-10 → bits 7-3
+				flags[value+3] = (uint8_t)((grb << 3) & 0xF8);	// Blue:  bits 4-0   → bits 7-3
+			#elif SCREEN == 8
 				uint8_t grb8 = colorTranslationSC8[idx];
 				flags[value+1] = (grb8 << 3) & 0xE0;	// Red:   bits 4-2 → bits 7-5
 				flags[value+2] = grb8 & 0xE0;			// Green: bits 7-5
