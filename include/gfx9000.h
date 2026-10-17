@@ -97,6 +97,7 @@ bool g9kDetect();
 void g9kInitB1BD16();
 void g9kSetReg(uint8_t reg, uint8_t value);
 void g9kDisplayOn();
+void g9kDisplayOff();
 void g9kSetScrollY(uint16_t y);
 void g9kSetPaletteRGB(uint8_t index, uint8_t r5, uint8_t g5, uint8_t b5) SDCC_STACKCALL;
 

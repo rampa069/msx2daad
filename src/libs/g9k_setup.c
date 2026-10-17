@@ -63,6 +63,20 @@ void g9kDisplayOn()
 }
 
 /*
+ * Function: g9kDisplayOff
+ * --------------------------------
+ * Blank the GFX9000 display (as after g9kInitB1BD16), before going back to
+ * MSX-DOS. It does not wait for the command engine: die() also calls it when
+ * there is no GFX9000, and P#5 then reads 0xFF (busy for ever).
+ *
+ * @return			none.
+ */
+void g9kDisplayOff()
+{
+	g9kSetReg(G9K_R_CONTROL, 0x42);		// R#8: display off, sprites off, 512 KB
+}
+
+/*
  * Function: g9kSetScrollY
  * --------------------------------
  * Show the image space from line `y` (layer A scroll, R#17-R#18). The new
