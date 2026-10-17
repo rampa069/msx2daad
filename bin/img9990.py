@@ -8,7 +8,9 @@ imgwizard.php with two chunk types of its own:
 
     "IMG" + 'G'                       magic and screen type
     128 Info                          { 1, chunks, width, height, 5 (BD16), 3 (GRB555), 4 (V9990) }
-    129 FixedImg (optional)           { offsetX, offsetY }
+    1   Palette (optional)            data 16 GRB555 words: the colours of INK, PAPER...
+    129 FixedImg (optional)           { offsetX, offsetY } or
+                                      { offsetX, offsetY, winX, winY, winW, winH } (window in characters)
     22  V9990Cmd                      extra header { n }, data n * 21 bytes (R#32-R#52)
     23  V9990CmdData (repeated)       extra header { compressor, uncompressed size }, data
 
@@ -44,6 +46,7 @@ except ImportError:
 
 CHUNK_INFO = 128
 CHUNK_FIXEDIMG = 129
+CHUNK_PALETTE = 1
 CHUNK_G9KCMD = 22
 CHUNK_G9KDATA = 23
 CHUNK_NAMES = {0: "Redirect", 1: "Palette", 17: "CLS", 19: "Pause", 20: "V9938Cmd", 21: "V9938CmdData",
@@ -177,7 +180,7 @@ def chunk(ctype, extra, data=b""):
     return struct.pack("<BHH", ctype, len(extra), len(data)) + extra + data
 
 
-def build_img(img, comp, zx0, fixed=None, mono=False):
+def build_img(img, comp, zx0, fixed=None, mono=False, window=None, palette=None, more=()):
     w, h = img.size
     if w > SCREEN_W or h > SCREEN_H:
         sys.exit(f"ERROR: {w}x{h} is larger than {SCREEN_W}x{SCREEN_H}")
@@ -185,12 +188,30 @@ def build_img(img, comp, zx0, fixed=None, mono=False):
     # WM 0xFFFF: every bit is written, so bit 15 (YS) ends up 0 whatever VRAM held
     cmd = struct.pack("<HHHHHHBBHHHB", 0, 0, 0, 0, w, h, 0, LOG_IMP, 0xFFFF, 0, 0, OP_LMMC)
     body = []
+    if palette:
+        # Legacy chunk layout, as imgwizard.php writes it: { 1, 32, 32 } and the 32 bytes
+        body.append(struct.pack("<BHH", CHUNK_PALETTE, 32, 32)
+                    + b"".join(struct.pack("<H", to_grb555(*c)) for c in palette))
     if fixed:
-        body.append(chunk(CHUNK_FIXEDIMG, struct.pack("<HH", *fixed)))
+        extra = struct.pack("<HH", *fixed)
+        if window:
+            extra += struct.pack("<BBBB", *window)
+        body.append(chunk(CHUNK_FIXEDIMG, extra))
     body.append(chunk(CHUNK_G9KCMD, bytes([1]), cmd))
     parts = split_chunks(data, comp, zx0)
     for cid, size, payload in parts:
         body.append(chunk(CHUNK_G9KDATA, struct.pack("<BH", cid, size), payload))
+    # Further rectangles (the graphic half of a font), each one LMMC with its data
+    for extra_img, dx, dy in more:
+        ew, eh = extra_img.size
+        data2 = bd16_bytes(extra_img, mono)
+        body.append(chunk(CHUNK_G9KCMD, bytes([1]),
+                          struct.pack("<HHHHHHBBHHHB", 0, 0, dx, dy, ew, eh, 0, LOG_IMP, 0xFFFF, 0, 0, OP_LMMC)))
+        more_parts = split_chunks(data2, comp, zx0)
+        for cid, size, payload in more_parts:
+            body.append(chunk(CHUNK_G9KDATA, struct.pack("<BH", cid, size), payload))
+        data += data2
+        parts += more_parts
     info = chunk(CHUNK_INFO, struct.pack("<BHHHBBB", 1, len(body) + 1, w, h,
                                          PIXEL_BD16, PALETTE_GRB555, CHIPSET_V9990))
     return b"IMGG" + info + b"".join(body), len(data), parts
@@ -207,8 +228,12 @@ def list_img(path):
         if t == CHUNK_INFO:
             v, n, w, h, px, pal, chip = struct.unpack("<BHHHBBB", extra)
             print(f"  {name}: version {v}, {n} chunks, {w}x{h}, pixel {px}, palette {pal}, chipset {chip}")
+        elif t == CHUNK_PALETTE:
+            words = struct.unpack_from("<16H", d, p + 5)
+            print(f"  {name}: " + " ".join(f"{w:04x}" for w in words))
         elif t == CHUNK_FIXEDIMG:
-            print(f"  {name}: offset {struct.unpack('<HH', extra)}")
+            print(f"  {name}: offset {struct.unpack_from('<HH', extra)}"
+                  + (f", window {tuple(extra[4:8])}" if len(extra) >= 8 else ""))
         elif t == CHUNK_G9KCMD:
             for i in range(extra[0]):
                 f = struct.unpack_from("<HHHHHHBBHHHB", d, p + 5 + a + i * 21)
@@ -236,6 +261,13 @@ def pair(text):
     return a, b
 
 
+def palette16(text):
+    cols = [tuple(bytes.fromhex(v)) for v in text.split(",")]
+    if len(cols) != 16 or any(len(c) != 3 for c in cols):
+        raise argparse.ArgumentTypeError("16 colours as RRGGBB")
+    return cols
+
+
 def quad(text):
     return tuple(int(v) for v in text.split(","))
 
@@ -250,9 +282,17 @@ def main():
         s.add_argument("-c", "--compressor", choices=("zx0", "rle", "raw"), default="zx0")
         s.add_argument("--zx0", help="path of the zx0 compressor")
         s.add_argument("--rect", type=quad, metavar="X,Y,W,H", help="crop the source")
+        if name == "font":
+            s.add_argument("--gchars", metavar="PNG",
+                           help="graphic charset (256x32, the same layout), loaded 264 lines below the font")
         if name == "image":
             s.add_argument("--fixed", type=pair, metavar="X,Y",
                            help="draw at this screen position instead of the current window")
+            s.add_argument("--palette", type=palette16, metavar="RRGGBB,...",
+                           help="16 colours for INK, PAPER and the rest (the palette a fixed DAAD picture sets)")
+            s.add_argument("--window", type=quad, metavar="C,R,W,H",
+                           help="with --fixed: the current window becomes this rectangle "
+                                "(column, row, width, height in characters), as a fixed DAAD picture does")
     s = sub.add_parser("list")
     s.add_argument("input")
     args = ap.parse_args()
@@ -268,8 +308,15 @@ def main():
         if args.cmd == "font" and rect is None:
             rect = (0, 0, 256, 32)          # 4 rows of 32 characters (8x8 cells)
         img = load_rgb(args.input, rect)
+        window = getattr(args, "window", None)
+        if window and (len(window) != 4 or not args.fixed):
+            sys.exit("ERROR: --window needs four values and --fixed")
+        more = []
+        if getattr(args, "gchars", None):
+            more.append((load_rgb(args.gchars, (0, 0, 256, 32)), 0, 264))
         out, raw_len, parts = build_img(img, comp, zx0, getattr(args, "fixed", None),
-                                        mono=(args.cmd == "font"))
+                                        mono=(args.cmd == "font"), window=window,
+                                        palette=getattr(args, "palette", None), more=more)
     finally:
         if zx0:
             zx0.close()

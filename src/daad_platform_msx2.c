@@ -67,6 +67,11 @@ static const char CHARS_MSX[]  = "\xA6\xAD\xA8\xAE\xAF\xA0\x82\xA1\xA2\xA3\xA4\x
 static bool offsetText;
 // OffsetY (in pixels) to set/unset the VRAM page where load images
 static uint16_t gfxPictureOffsetY;
+#ifdef V9990
+// Set while FONT.IMG loads: the font and the graphic charset lie below the
+// screen, so the picture is not clipped to the window
+static bool g9kLoadingFont;
+#endif
 // OffsetY (in pixels) to set/unset the VRAM page where write text (GFX 7/8)
 static uint16_t gfxTextOffsetY;
 // Current VRAM page visible
@@ -281,14 +286,25 @@ void loadFilesBin(int argc, char **argv)
 	memcpy(FILE_IMG, FILE_LOAD, 11);
 	cw = (Window*)(heap_top+IMG_MAXREAD);	//Fake current Window
 	cw->winX = cw->winY = 0;
+	cw->winW = MAX_COLUMNS;					// Whole screen: pictures are clipped to the window
+	cw->winH = MAX_LINES;
 	gfxWinOffsetX = gfxWinOffsetY = 0;
+	#ifdef V9990
+		g9kLoadingFont = false;		// The CRT0 does not clear uninitialised data
+	#endif
 	gfxPictureShow();
 
 	// Load image FONT (old DMG) to VRAM hidden zone
 	memcpy(FILE_IMG, FILE_FONT, 11);
 	gfxPictureOffsetY = FONTINITY;
+	#ifdef V9990
+		g9kLoadingFont = true;		// Font and graphic charset lie below the screen: no clipping
+	#endif
 	gfxPictureShow();
 	// Restore & free
+	#ifdef V9990
+		g9kLoadingFont = false;
+	#endif
 	gfxPictureOffsetY = 0;
 	memcpy(FILE_IMG, aux, 11);
 	free(11);
@@ -508,16 +524,62 @@ void printXMES(uint16_t address)
 	// LMMC of the picture being loaded: its data is in the VRAM picture buffer
 	static G9K_CMD g9kPicture;
 	static bool g9kPicturePending;
+	// The picture is clipped to the window current at DISPLAY ("the action will
+	// introduce the required window data and clipped picture to the current
+	// stream", DAAD manual 1991). A FIXEDIMG picture is not clipped.
+	static bool g9kClipToWindow;
+	static uint16_t g9kClipW, g9kClipH;		// Room in pixels from the picture origin
+
+	// Window limit in pixels: a window that reaches the last column or line
+	// also covers the pixels left over beyond it (256 = 42 columns of 6 + 4).
+	static uint16_t g9kWindowLimit(uint8_t end, uint8_t maxChars, uint8_t charSize, uint16_t screenSize)
+	{
+		return end >= maxChars ? screenSize : (uint16_t)end * charSize;
+	}
+
+	static void g9kPictureClip(const G9K_CMD *cmd)
+	{
+		uint16_t right, bottom;
+
+		if (!g9kClipToWindow) {
+			g9kClipW = g9kClipH = 0xffff;
+			return;
+		}
+		right = g9kWindowLimit(cw->winX + cw->winW, MAX_COLUMNS, FONTWIDTH, SCREEN_WIDTH);
+		bottom = g9kWindowLimit(cw->winY + cw->winH, MAX_LINES, FONTHEIGHT, SCREEN_HEIGHT) + gfxPictureOffsetY;
+		g9kClipW = cmd->dx < right ? right - cmd->dx : 0;
+		g9kClipH = cmd->dy < bottom ? bottom - cmd->dy : 0;
+	}
 
 	static void g9kPictureDraw()
 	{
+		uint32_t sa = G9K_VRAM_SCRATCH;
+		uint16_t width, lines;
+
 		if (!g9kPicturePending) return;
 		g9kPicturePending = false;
-		g9kPicture.sx = (uint8_t)G9K_VRAM_SCRATCH;					// BMXL source address: SA bits 7-0
-		g9kPicture.sy = (uint16_t)(G9K_VRAM_SCRATCH >> 8);			// SA bits 18-8
+		width = g9kPicture.nx;
+		if (g9kPicture.ny > g9kClipH) g9kPicture.ny = g9kClipH;
+		if (!g9kPicture.ny || !g9kClipW) return;
 		g9kPicture.arg = 0;
 		g9kPicture.op = G9K_OP_BMXL;
-		g9kSendCmd(&g9kPicture);
+		if (width <= g9kClipW) {
+			g9kPicture.sx = (uint8_t)sa;						// BMXL source address: SA bits 7-0
+			g9kPicture.sy = (uint16_t)(sa >> 8);				// SA bits 18-8
+			g9kSendCmd(&g9kPicture);
+			return;
+		}
+		// Narrower window: one BMXL per line, as the buffer keeps the full width
+		lines = g9kPicture.ny;
+		g9kPicture.nx = g9kClipW;
+		g9kPicture.ny = 1;
+		while (lines--) {
+			g9kPicture.sx = (uint8_t)sa;
+			g9kPicture.sy = (uint16_t)(sa >> 8);
+			g9kSendCmd(&g9kPicture);
+			g9kPicture.dy++;
+			sa += (uint32_t)width * 2;
+		}
 	}
 #endif
 
@@ -707,9 +769,17 @@ void gfxSetScreenModeFlags()
  */
 void gfxClearScreenBlock(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
-	static uint16_t w2;
+	static uint16_t w2, h2;
 	w2 = w<MAX_COLUMNS ? w*FONTWIDTH : SCREEN_WIDTH;
-	bitBlt(0, 0, x*FONTWIDTH, y*FONTHEIGHT, w2, h*FONTHEIGHT, COLOR_PAPER, 0, CMD_HMMV);
+	h2 = h*FONTHEIGHT;
+	#ifdef V9990
+		// As g9kPictureClip(): a window reaching the last column or line covers
+		// the pixels left over beyond it (256 = 42 x 6 + 4, 212 = 26 x 8 + 4),
+		// which pictures may draw on. y counts the back page as 32 lines more.
+		if (x + w >= MAX_COLUMNS) w2 = SCREEN_WIDTH - x*FONTWIDTH;
+		if ((y % 32) + h >= MAX_LINES) h2 = SCREEN_HEIGHT - (y % 32)*FONTHEIGHT;
+	#endif
+	bitBlt(0, 0, x*FONTWIDTH, y*FONTHEIGHT, w2, h2, COLOR_PAPER, 0, CMD_HMMV);
 }
 
 /*
@@ -991,6 +1061,9 @@ inline bool gfxPictureShow()
 	// stream" (DAAD manual 1991, DISPLAY). A FIXEDIMG chunk can still override it.
 	gfxWinOffsetX = cw->winX * FONTWIDTH;
 	gfxWinOffsetY = cw->winY * FONTHEIGHT;
+	#ifdef V9990
+		g9kClipToWindow = !g9kLoadingFont;
+	#endif
 
 	fp = fopen(FILE_IMG);
 	if (fp<0xff00) {
@@ -1026,7 +1099,20 @@ inline bool gfxPictureShow()
 			//=============================================
 			// Load image palette
 			if (chunk->type==IMG_CHUNK_PALETTE) {
-				#if SCREEN!=8 && SCREEN!=12 && !defined(V9990)
+				#if defined(V9990)
+					// 16 GRB555 words. The pixels are direct colour, so only the
+					// colours of INK, PAPER and the rest follow it, as the palette
+					// of a fixed picture does in DAAD (DMG, DAAD manual 1991).
+					size = fread(chunk->data, 32);
+					if (!(size & 0xff00)) {
+						uint16_t *grb = (uint16_t*)chunk->data;
+						for (uint8_t i=0; i<16; i++) {
+							uint16_t c = grb[i] & 0x7fff;
+							colorTranslation[i] = c;
+							g9kSetPaletteRGB(i, (c >> 5) & 31, (c >> 10) & 31, c & 31);
+						}
+					}
+				#elif SCREEN!=8 && SCREEN!=12
 					size = fread(chunk->data, 32);
 					if (!(size & 0xff00)) {
 						memcpy((void*)colorTranslation, chunk->data, 32);
@@ -1039,9 +1125,20 @@ inline bool gfxPictureShow()
 			//=============================================
 			// Load image fixed coordinates for next chunks (like V9938Cmd/CmdData)
 			if (chunk->type==IMG_CHUNK_FIXEDIMG) {
-				size = fread(chunk->data, 4);
+				uint16_t extra = ((IMG_CHUNK_HEADER*)chunk)->extraHeaderSize;
+				size = fread(chunk->data, extra + ((IMG_CHUNK_HEADER*)chunk)->dataSize);
 				gfxWinOffsetX = ((IMG_FIXEDIMG*)chunk)->offsetX;
 				gfxWinOffsetY = ((IMG_FIXEDIMG*)chunk)->offsetY;
+				if (extra >= 8) {
+					IMG_FIXEDIMG *fixed = (IMG_FIXEDIMG*)chunk;
+					cw->winX = fixed->winX;
+					cw->winY = fixed->winY;
+					cw->winW = fixed->winW;
+					cw->winH = fixed->winH;
+				}
+				#ifdef V9990
+					g9kClipToWindow = false;
+				#endif
 			} else
 #ifdef V9990
 			//=============================================
@@ -1061,6 +1158,7 @@ inline bool gfxPictureShow()
 						g9kPictureDraw();
 						if (cmd->op == G9K_OP_LMMC) {
 							memcpy(&g9kPicture, cmd, sizeof(G9K_CMD));
+							g9kPictureClip(cmd);
 							g9kPicturePending = true;
 							g9kScratchBegin();
 						} else {

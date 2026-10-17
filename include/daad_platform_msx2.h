@@ -279,10 +279,18 @@ typedef struct {
 } IMG_INFO;
 
 typedef struct {
-	IMG_CHUNK_HEADER header;		// { 22, 4, 0 } Type=22 (FixedImg chunk), extraHeaderSize=4, dataSize=0
+	IMG_CHUNK_HEADER header;		// { 129, 4|8, 0 } Type=129 (FixedImg chunk), extraHeaderSize=4 or 8, dataSize=0
 	// Extra header (4 bytes)
 	uint16_t offsetX;				// { x } Global Offset X in pixels (max: offsetX + imageWidth <= ScreenWidth)
 	uint16_t offsetY;				// { y } Global Offset Y in pixels (max: offsetY + imageHeight <= ScreenHeight)
+	// Optional (extraHeaderSize=8): the current window becomes this rectangle, in
+	// characters, as a fixed picture does in DAAD ("the coordinates and size of
+	// the window selected at that moment adapt to those of the picture", DMG,
+	// DAAD manual 1991)
+	uint8_t  winX;
+	uint8_t  winY;
+	uint8_t  winW;
+	uint8_t  winH;
 	// No data
 } IMG_FIXEDIMG;
 
